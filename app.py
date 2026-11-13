@@ -1,575 +1,1390 @@
-from __future__ import annotations
-
-import hashlib
+import json
 import math
-import re
+import random
 import time
-from typing import Dict, List, Tuple
+from pathlib import Path
 
 import numpy as np
 import streamlit as st
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
+# ============================================================
+# FRUITZIM LLM
+# Decoder-only Transformer treinado do zero
+# ============================================================
 
-# -----------------------------------------------------------------------------
-# Configuração da arquitetura
-# -----------------------------------------------------------------------------
-# O vetor de entrada contém 64 características numéricas e não é contado como
-# camada de neurônios. A contagem solicitada considera as unidades das camadas
-# ocultas e da camada de saída: 4096 + 1354 + 8 = 5458.
-INPUT_DIM = 64
-HASH_DIM = 56
-HIDDEN_1 = 4096
-HIDDEN_2 = 1354
-OUTPUT_DIM = 8
-TOTAL_NEURONS = HIDDEN_1 + HIDDEN_2 + OUTPUT_DIM
+APP_DIR = Path(__file__).parent
+DATA_DIR = APP_DIR / "fruitzim_data"
+DATA_DIR.mkdir(exist_ok=True)
 
-LEARNING_RATE = 0.0002
-MAX_GRAD_NORM = 1.0
+CHECKPOINT_PATH = DATA_DIR / "fruitzim_checkpoint.pt"
+VOCAB_PATH = DATA_DIR / "vocab.json"
+FEEDBACK_PATH = DATA_DIR / "feedback.json"
 
-ACTIONS: List[str] = [
-    "acolhimento",
-    "explicação",
-    "organização",
-    "pergunta",
-    "síntese",
-    "incentivo",
-    "análise",
-    "criatividade",
-]
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# -----------------------------------------------------------------------------
-# Vetorização de texto sem dependências externas
-# -----------------------------------------------------------------------------
-def text_to_vector(text: str) -> np.ndarray:
-    """Converte texto em um vetor real de 64 características."""
-    normalized = text.casefold()
-    tokens = re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
+BUILTIN_CORPUS = """
+Fruitzim é uma pequena maçã neural que está aprendendo português.
+Olá! Eu sou o Fruitzim. Gosto de conversar, aprender palavras e descobrir ideias.
+Como você está hoje? Podemos conversar sobre ciência, tecnologia, livros e criatividade.
+Uma rede neural é um programa matemático formado por parâmetros que são ajustados durante o treinamento.
+Um modelo de linguagem aprende padrões em textos e tenta prever qual token vem a seguir.
+Um Transformer usa atenção para relacionar diferentes partes de uma sequência.
+A atenção causal permite que cada posição consulte apenas os tokens anteriores e o token atual.
+O treinamento começa com parâmetros aleatórios. Os exemplos de texto ajudam o modelo a ajustar esses parâmetros.
+A função de perda mede o quanto as previsões do modelo diferem dos próximos caracteres esperados.
+O otimizador Adam atualiza os parâmetros usando gradientes calculados pela retropropagação.
+Python é uma linguagem de programação usada em ciência de dados, automação e inteligência artificial.
+NumPy oferece operações eficientes com vetores e matrizes.
+PyTorch oferece tensores, diferenciação automática e ferramentas para construir redes neurais.
+Streamlit permite criar aplicações web interativas usando Python.
+A curiosidade é importante: fazer perguntas, testar hipóteses e conferir resultados ajuda a aprender.
+Na ciência, uma hipótese precisa ser comparada com evidências e pode ser revisada quando surgem novos dados.
+A matemática descreve relações usando números, símbolos, funções e estruturas.
+A física investiga matéria, energia, movimento, espaço e tempo.
+A biologia estuda os seres vivos e suas relações com o ambiente.
+A história analisa acontecimentos humanos usando fontes e interpretações críticas.
+A literatura usa linguagem para criar narrativas, imagens, personagens e ideias.
+Uma boa explicação organiza o assunto em etapas e apresenta exemplos claros.
+Se uma resposta estiver confusa, podemos reformular a pergunta e tentar novamente.
+O aprendizado de máquina não é magia: depende de dados, objetivos, parâmetros e avaliação.
+Modelos pequenos têm capacidade limitada e podem repetir frases ou produzir erros.
+Uma conversa útil exige contexto, clareza e atenção ao que foi realmente perguntado.
+O Fruitzim ainda é pequeno, mas pode melhorar quando recebe mais exemplos de texto variados.
+"""
 
-    if not tokens:
-        tokens = ["mensagem_vazia"]
-
-    vector = np.zeros(INPUT_DIM, dtype=np.float32)
-
-    # Hashing trick com sinal: palavras e pares de palavras ocupam 56 posições.
-    features: List[Tuple[str, float]] = [(token, 1.0) for token in tokens]
-    features.extend(
-        (f"{tokens[i]}_{tokens[i + 1]}", 0.65)
-        for i in range(len(tokens) - 1)
-    )
-
-    for feature, weight in features:
-        digest = hashlib.blake2b(
-            feature.encode("utf-8"), digest_size=8
-        ).digest()
-        index = int.from_bytes(digest[:4], byteorder="little") % HASH_DIM
-        sign = 1.0 if digest[4] & 1 else -1.0
-        vector[index] += np.float32(sign * weight)
-
-    # Normalização da parte textual.
-    text_norm = float(np.linalg.norm(vector[:HASH_DIM]))
-    if text_norm > 0.0:
-        vector[:HASH_DIM] /= np.float32(text_norm)
-
-    # Oito características simples adicionais.
-    token_set = set(tokens)
-    vector[56] = min(len(tokens), 60) / 60.0
-    vector[57] = float("?" in text)
-    vector[58] = float("!" in text)
-    vector[59] = float(bool(token_set & {"não", "nunca", "jamais", "nenhum"}))
-    vector[60] = float(bool(token_set & {"ajuda", "socorro", "problema", "dúvida"}))
-    vector[61] = float(bool(token_set & {"obrigado", "obrigada", "valeu"}))
-    vector[62] = float(text.isupper() and any(char.isalpha() for char in text))
-    vector[63] = min(len(text), 1000) / 1000.0
-
-    return vector
-
-
-# -----------------------------------------------------------------------------
-# Rede neural e aprendizado por reforço
-# -----------------------------------------------------------------------------
-class FruitzimNetwork:
-    """MLP ReLU/ReLU/Softmax treinada como contextual bandit via REINFORCE."""
-
-    def __init__(self, seed: int | None = None) -> None:
-        self.rng = np.random.default_rng(seed)
-
-        # Inicialização He para camadas ReLU e inicialização menor na saída.
-        self.W1 = self.rng.standard_normal(
-            (INPUT_DIM, HIDDEN_1), dtype=np.float32
-        ) * np.float32(math.sqrt(2.0 / INPUT_DIM))
-        self.b1 = np.zeros(HIDDEN_1, dtype=np.float32)
-
-        self.W2 = self.rng.standard_normal(
-            (HIDDEN_1, HIDDEN_2), dtype=np.float32
-        ) * np.float32(math.sqrt(2.0 / HIDDEN_1))
-        self.b2 = np.zeros(HIDDEN_2, dtype=np.float32)
-
-        self.W3 = self.rng.standard_normal(
-            (HIDDEN_2, OUTPUT_DIM), dtype=np.float32
-        ) * np.float32(math.sqrt(1.0 / HIDDEN_2))
-        self.b3 = np.zeros(OUTPUT_DIM, dtype=np.float32)
-
-        self.training_cycles = 0
-        self.reward_baseline = 0.0
-        self.has_baseline = False
-        self.last_reward: float | None = None
-        self.last_active_neurons = 0
-        self.last_confidence = 0.0
-
-    def forward(
-        self, x: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Forward pass: vetor -> ReLU -> ReLU -> Softmax."""
-        x = np.asarray(x, dtype=np.float32).reshape(1, INPUT_DIM)
-
-        z1 = x @ self.W1 + self.b1
-        a1 = np.maximum(z1, 0.0)
-
-        z2 = a1 @ self.W2 + self.b2
-        a2 = np.maximum(z2, 0.0)
-
-        logits = a2 @ self.W3 + self.b3
-        logits -= np.max(logits, axis=1, keepdims=True)
-        exp_logits = np.exp(logits)
-        probabilities = exp_logits / np.sum(
-            exp_logits, axis=1, keepdims=True
-        )
-
-        return a1, a2, probabilities
-
-    def choose_action(
-        self, text: str
-    ) -> Tuple[np.ndarray, int, np.ndarray, int]:
-        """Processa a mensagem e sorteia uma ação segundo a política Softmax."""
-        x = text_to_vector(text)
-        a1, a2, probabilities = self.forward(x)
-
-        probs = probabilities[0].astype(np.float64)
-        probs /= probs.sum()
-        action = int(self.rng.choice(OUTPUT_DIM, p=probs))
-
-        # Ativo = ReLU positivo nas camadas ocultas ou saída >= probabilidade
-        # uniforme. A definição evita contar toda unidade Softmax como ativa.
-        active_outputs = int(
-            np.count_nonzero(probabilities[0] >= (1.0 / OUTPUT_DIM))
-        )
-        active_neurons = int(
-            np.count_nonzero(a1)
-            + np.count_nonzero(a2)
-            + active_outputs
-        )
-
-        self.last_active_neurons = active_neurons
-        self.last_confidence = float(probabilities[0, action])
-
-        return x, action, probabilities[0].copy(), active_neurons
-
-    def reinforce(
-        self, x: np.ndarray, action: int, reward: float
-    ) -> Tuple[float, float]:
-        """Atualiza W1/W2/W3 com gradiente de política REINFORCE.
-
-        Trata cada mensagem como uma rodada de contextual bandit. O objetivo é
-        maximizar log(pi(ação | contexto)) * vantagem. O baseline móvel reduz
-        a variância da estimativa; o gradiente é limitado antes da atualização.
-        """
-        if not 0 <= int(action) < OUTPUT_DIM:
-            raise ValueError("Ação fora do intervalo válido.")
-
-        x = np.asarray(x, dtype=np.float32).reshape(1, INPUT_DIM)
-        a1, a2, probabilities = self.forward(x)
-
-        if self.has_baseline:
-            advantage = float(reward - self.reward_baseline)
-        else:
-            advantage = float(reward)
-        advantage = float(np.clip(advantage, -2.0, 2.0))
-
-        # Gradiente da log-probabilidade da ação amostrada.
-        grad_logits = -probabilities.copy()
-        grad_logits[0, int(action)] += 1.0
-        grad_logits *= np.float32(advantage)
-
-        grad_W3 = a2.T @ grad_logits
-        grad_b3 = np.sum(grad_logits, axis=0)
-
-        # Calcula os gradientes usando os pesos anteriores à atualização.
-        grad_a2 = grad_logits @ self.W3.T
-        grad_z2 = grad_a2 * (a2 > 0.0)
-        grad_W2 = a1.T @ grad_z2
-        grad_b2 = np.sum(grad_z2, axis=0)
-
-        grad_a1 = grad_z2 @ self.W2.T
-        grad_z1 = grad_a1 * (a1 > 0.0)
-        grad_W1 = x.T @ grad_z1
-        grad_b1 = np.sum(grad_z1, axis=0)
-
-        gradients = (
-            grad_W1,
-            grad_b1,
-            grad_W2,
-            grad_b2,
-            grad_W3,
-            grad_b3,
-        )
-        squared_norm = sum(
-            float(np.sum(gradient * gradient, dtype=np.float64))
-            for gradient in gradients
-        )
-        gradient_norm = math.sqrt(squared_norm)
-        scale = min(1.0, MAX_GRAD_NORM / (gradient_norm + 1e-12))
-        step = np.float32(LEARNING_RATE * scale)
-
-        # Ascensão do gradiente: aumenta a probabilidade de ações recompensadas
-        # e diminui a de ações punidas para contextos semelhantes.
-        self.W1 += step * grad_W1
-        self.b1 += step * grad_b1
-        self.W2 += step * grad_W2
-        self.b2 += step * grad_b2
-        self.W3 += step * grad_W3
-        self.b3 += step * grad_b3
-
-        # Baseline móvel da recompensa.
-        if self.has_baseline:
-            self.reward_baseline = (
-                0.9 * self.reward_baseline + 0.1 * float(reward)
-            )
-        else:
-            self.reward_baseline = float(reward)
-            self.has_baseline = True
-
-        self.training_cycles += 1
-        self.last_reward = float(reward)
-
-        return advantage, gradient_norm
-
-    def weight_l2_norm(self) -> float:
-        """Norma L2 conjunta das três matrizes de pesos."""
-        squared = (
-            float(np.sum(self.W1 * self.W1, dtype=np.float64))
-            + float(np.sum(self.W2 * self.W2, dtype=np.float64))
-            + float(np.sum(self.W3 * self.W3, dtype=np.float64))
-        )
-        return math.sqrt(squared)
-
-
-# -----------------------------------------------------------------------------
-# Camada de resposta: a rede escolhe o estilo; os textos são templates locais.
-# -----------------------------------------------------------------------------
-def make_response(text: str, action: int) -> str:
-    """Gera uma resposta simples baseada no estilo escolhido pela rede."""
-    excerpt = re.sub(r"\s+", " ", text).strip()
-    if len(excerpt) > 150:
-        excerpt = excerpt[:147].rstrip() + "..."
-
-    # Escapa caracteres Markdown para tratar a entrada como citação simples.
-    excerpt = re.sub(r"([\\`*_{}\[\]()#+.!|>~-])", r"\\\1", excerpt)
-    topic = excerpt or "sua mensagem"
-
-    responses = [
-        (
-            f'Entendi o que você trouxe: “{topic}”. '
-            "Vou abordar isso com cuidado e separar o que já sabemos "
-            "do que ainda precisa ser esclarecido."
-        ),
-        (
-            f'O ponto central parece ser “{topic}”. '
-            "Vamos por partes: primeiro definimos o objetivo, depois reunimos "
-            "as informações e, por fim, avaliamos as possibilidades."
-        ),
-        (
-            f"Vou organizar a ideia: **{topic}**\n\n"
-            "1. Definir o que você quer descobrir.\n"
-            "2. Separar fatos de suposições.\n"
-            "3. Escolher um próximo passo verificável."
-        ),
-        (
-            f'Quero entender melhor “{topic}”. '
-            "Qual é o detalhe dessa situação que mais importa para você?"
-        ),
-        (
-            f'Em resumo, você trouxe “{topic}”. '
-            "O próximo passo é transformar isso em uma pergunta ou objetivo "
-            "bem definido."
-        ),
-        (
-            f'Você já começou ao colocar “{topic}” em palavras. '
-            "Agora vale avançar em uma etapa pequena, concreta e verificável."
-        ),
-        (
-            f'Uma análise inicial de “{topic}” pode considerar três pontos: '
-            "contexto, evidências e alternativas. Sem esses elementos, "
-            "qualquer conclusão seria precipitada."
-        ),
-        (
-            f'Podemos explorar “{topic}” por outro ângulo: '
-            "transformar a ideia em um exemplo, um esquema ou uma pequena "
-            "experiência."
-        ),
-    ]
-    return responses[int(action)]
-
-
-def get_mood(agent: FruitzimNetwork) -> Tuple[str, str]:
-    if agent.last_reward is not None:
-        if agent.last_reward >= 0.8:
-            return "🥰", "Fruitzim está radiante"
-        if agent.last_reward > 0.0:
-            return "😊", "Fruitzim recebeu carinho"
-        if agent.last_reward < 0.0:
-            return "🥺", "Fruitzim está recalibrando"
-
-    activation_ratio = agent.last_active_neurons / TOTAL_NEURONS
-    if activation_ratio > 0.65:
-        return "🤩", "Fruitzim está bem ativado"
-    if activation_ratio > 0.0:
-        return "🤓", "Fruitzim está concentrado"
-    return "🍎", "Fruitzim está aguardando uma mensagem"
-
-
-# -----------------------------------------------------------------------------
-# Estado de sessão e callbacks do Streamlit
-# -----------------------------------------------------------------------------
-def initialize_session() -> None:
-    if "fruitzim_agent" not in st.session_state:
-        seed = int(np.random.SeedSequence().generate_state(1)[0])
-        st.session_state.fruitzim_agent = FruitzimNetwork(seed=seed)
-
-    if "fruitzim_messages" not in st.session_state:
-        st.session_state.fruitzim_messages = []
-
-    if "fruitzim_last_interaction" not in st.session_state:
-        st.session_state.fruitzim_last_interaction = None
-
-
-def apply_feedback(reward: float, label: str) -> None:
-    """Callback executado pelos botões de feedback."""
-    trace = st.session_state.get("fruitzim_last_interaction")
-    if not trace or not trace.get("pending", False):
-        return
-
-    agent: FruitzimNetwork = st.session_state.fruitzim_agent
-    advantage, gradient_norm = agent.reinforce(
-        np.asarray(trace["x"], dtype=np.float32),
-        int(trace["action"]),
-        float(reward),
-    )
-
-    updated_trace = dict(trace)
-    updated_trace["pending"] = False
-    updated_trace["feedback_label"] = label
-    updated_trace["reward"] = float(reward)
-    updated_trace["advantage"] = float(advantage)
-    updated_trace["gradient_norm"] = float(gradient_norm)
-    st.session_state.fruitzim_last_interaction = updated_trace
-
-    messages = st.session_state.fruitzim_messages
-    if messages and messages[-1].get("role") == "assistant":
-        messages[-1]["feedback"] = label
-
-
-# -----------------------------------------------------------------------------
-# Interface
-# -----------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Fruitzim | Maçã IA",
-    page_icon="🍎",
-    layout="wide",
-    initial_sidebar_state="expanded",
+SYSTEM_PROMPT = (
+    "Você é Fruitzim, uma pequena maçã assistente. "
+    "Responda em português, com clareza, educação e honestidade. "
+    "Se não souber, admita. Use o contexto da conversa quando disponível.\n"
 )
+
+
+# ============================================================
+# TOKENIZER
+# ============================================================
+
+class CharTokenizer:
+
+    def __init__(self, chars=None):
+        self.special = ["<PAD>", "<UNK>", "<BOS>", "<EOS>"]
+        self.chars = sorted(set(chars or []))
+
+        self.itos = self.special + self.chars
+        self.stoi = {
+            char: index
+            for index, char in enumerate(self.itos)
+        }
+
+        self.pad_id = 0
+        self.unk_id = 1
+        self.bos_id = 2
+        self.eos_id = 3
+
+    @classmethod
+    def from_text(cls, text):
+        return cls(set(text))
+
+    def encode(self, text, add_bos=False, add_eos=False):
+
+        ids = [
+            self.stoi.get(char, self.unk_id)
+            for char in text
+        ]
+
+        if add_bos:
+            ids.insert(0, self.bos_id)
+
+        if add_eos:
+            ids.append(self.eos_id)
+
+        return ids
+
+    def decode(self, ids):
+
+        output = []
+
+        for index in ids:
+
+            index = int(index)
+
+            if 4 <= index < len(self.itos):
+                output.append(self.itos[index])
+
+        return "".join(output)
+
+    def to_dict(self):
+        return {"chars": self.chars}
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(data["chars"])
+
+
+# ============================================================
+# CAUSAL SELF ATTENTION
+# ============================================================
+
+class CausalSelfAttention(nn.Module):
+
+    def __init__(
+        self,
+        n_embd,
+        n_head,
+        dropout,
+        block_size
+    ):
+
+        super().__init__()
+
+        assert n_embd % n_head == 0
+
+        self.n_head = n_head
+        self.head_dim = n_embd // n_head
+
+        self.qkv = nn.Linear(
+            n_embd,
+            3 * n_embd
+        )
+
+        self.proj = nn.Linear(
+            n_embd,
+            n_embd
+        )
+
+        self.attn_drop = nn.Dropout(dropout)
+        self.resid_drop = nn.Dropout(dropout)
+
+        mask = torch.tril(
+            torch.ones(block_size, block_size)
+        )
+
+        self.register_buffer(
+            "causal_mask",
+            mask.view(1, 1, block_size, block_size)
+        )
+
+    def forward(self, x):
+
+        B, T, C = x.shape
+
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+
+        q = q.view(
+            B, T, self.n_head, self.head_dim
+        ).transpose(1, 2)
+
+        k = k.view(
+            B, T, self.n_head, self.head_dim
+        ).transpose(1, 2)
+
+        v = v.view(
+            B, T, self.n_head, self.head_dim
+        ).transpose(1, 2)
+
+        scores = (
+            q @ k.transpose(-2, -1)
+        ) / math.sqrt(self.head_dim)
+
+        scores = scores.masked_fill(
+            self.causal_mask[:, :, :T, :T] == 0,
+            float("-inf")
+        )
+
+        weights = self.attn_drop(
+            F.softmax(scores, dim=-1)
+        )
+
+        y = weights @ v
+
+        y = y.transpose(
+            1, 2
+        ).contiguous().view(B, T, C)
+
+        return self.resid_drop(
+            self.proj(y)
+        )
+
+
+# ============================================================
+# TRANSFORMER BLOCK
+# ============================================================
+
+class TransformerBlock(nn.Module):
+
+    def __init__(
+        self,
+        n_embd,
+        n_head,
+        dropout,
+        block_size
+    ):
+
+        super().__init__()
+
+        self.ln1 = nn.LayerNorm(n_embd)
+
+        self.attention = CausalSelfAttention(
+            n_embd,
+            n_head,
+            dropout,
+            block_size
+        )
+
+        self.ln2 = nn.LayerNorm(n_embd)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.GELU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+
+        x = x + self.attention(
+            self.ln1(x)
+        )
+
+        x = x + self.mlp(
+            self.ln2(x)
+        )
+
+        return x
+
+
+# ============================================================
+# FRUITZIM GPT
+# ============================================================
+
+class FruitzimGPT(nn.Module):
+
+    def __init__(
+        self,
+        vocab_size,
+        block_size=128,
+        n_embd=64,
+        n_head=4,
+        n_layer=2,
+        dropout=0.1
+    ):
+
+        super().__init__()
+
+        self.block_size = block_size
+
+        self.token_emb = nn.Embedding(
+            vocab_size,
+            n_embd
+        )
+
+        self.pos_emb = nn.Embedding(
+            block_size,
+            n_embd
+        )
+
+        self.drop = nn.Dropout(dropout)
+
+        self.blocks = nn.Sequential(*[
+            TransformerBlock(
+                n_embd,
+                n_head,
+                dropout,
+                block_size
+            )
+            for _ in range(n_layer)
+        ])
+
+        self.ln_f = nn.LayerNorm(n_embd)
+
+        self.head = nn.Linear(
+            n_embd,
+            vocab_size,
+            bias=False
+        )
+
+        self.apply(self._init_weights)
+
+        self.head.weight = self.token_emb.weight
+
+    @staticmethod
+    def _init_weights(module):
+
+        if isinstance(module, nn.Linear):
+
+            nn.init.normal_(
+                module.weight,
+                mean=0.0,
+                std=0.02
+            )
+
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+        elif isinstance(module, nn.Embedding):
+
+            nn.init.normal_(
+                module.weight,
+                mean=0.0,
+                std=0.02
+            )
+
+    def forward(self, idx, targets=None):
+
+        B, T = idx.shape
+
+        if T > self.block_size:
+            idx = idx[:, -self.block_size:]
+            T = idx.shape[1]
+
+        positions = torch.arange(
+            T,
+            device=idx.device
+        ).unsqueeze(0)
+
+        x = self.drop(
+            self.token_emb(idx) +
+            self.pos_emb(positions)
+        )
+
+        x = self.blocks(x)
+
+        logits = self.head(
+            self.ln_f(x)
+        )
+
+        loss = None
+
+        if targets is not None:
+
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1)
+            )
+
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(
+        self,
+        idx,
+        max_new_tokens=240,
+        temperature=0.85,
+        top_k=30
+    ):
+
+        self.eval()
+
+        for _ in range(max_new_tokens):
+
+            context = idx[:, -self.block_size:]
+
+            logits, _ = self(context)
+
+            logits = (
+                logits[:, -1, :] /
+                max(temperature, 0.01)
+            )
+
+            if top_k and top_k < logits.size(-1):
+
+                values, _ = torch.topk(
+                    logits,
+                    top_k
+                )
+
+                logits[
+                    logits < values[:, [-1]]
+                ] = -float("inf")
+
+            probabilities = F.softmax(
+                logits,
+                dim=-1
+            )
+
+            next_token = torch.multinomial(
+                probabilities,
+                num_samples=1
+            )
+
+            idx = torch.cat(
+                (idx, next_token),
+                dim=1
+            )
+
+        return idx
+
+
+# ============================================================
+# MODEL MANAGEMENT
+# ============================================================
+
+def build_model(tokenizer, config=None):
+
+    config = config or {}
+
+    model = FruitzimGPT(
+        vocab_size=len(tokenizer.itos),
+        block_size=config.get("block_size", 128),
+        n_embd=config.get("n_embd", 64),
+        n_head=config.get("n_head", 4),
+        n_layer=config.get("n_layer", 2),
+        dropout=config.get("dropout", 0.1)
+    )
+
+    return model.to(DEVICE)
+
+
+def save_checkpoint(
+    model,
+    tokenizer,
+    config,
+    trained_steps,
+    corpus_chars
+):
+
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "config": config,
+            "trained_steps": trained_steps,
+            "corpus_chars": corpus_chars
+        },
+        CHECKPOINT_PATH
+    )
+
+    VOCAB_PATH.write_text(
+        json.dumps(
+            tokenizer.to_dict(),
+            ensure_ascii=False
+        ),
+        encoding="utf-8"
+    )
+
+
+def load_checkpoint():
+
+    if not CHECKPOINT_PATH.exists():
+        return None
+
+    if not VOCAB_PATH.exists():
+        return None
+
+    try:
+
+        checkpoint = torch.load(
+            CHECKPOINT_PATH,
+            map_location=DEVICE,
+            weights_only=False
+        )
+
+        tokenizer = CharTokenizer.from_dict(
+            json.loads(
+                VOCAB_PATH.read_text(
+                    encoding="utf-8"
+                )
+            )
+        )
+
+        model = build_model(
+            tokenizer,
+            checkpoint["config"]
+        )
+
+        model.load_state_dict(
+            checkpoint["model_state"]
+        )
+
+        return model, tokenizer, checkpoint
+
+    except Exception as error:
+
+        st.warning(
+            f"Erro ao carregar modelo: {error}"
+        )
+
+        return None
+
+
+# ============================================================
+# TRAINING
+# ============================================================
+
+def make_batches(data, batch_size, block_size):
+
+    max_start = len(data) - block_size - 1
+
+    if max_start <= 0:
+        raise ValueError(
+            "Corpus insuficiente para o contexto escolhido."
+        )
+
+    starts = torch.randint(
+        0,
+        max_start,
+        (batch_size,)
+    )
+
+    x = torch.stack([
+        data[start:start + block_size]
+        for start in starts
+    ])
+
+    y = torch.stack([
+        data[start + 1:start + block_size + 1]
+        for start in starts
+    ])
+
+    return x.to(DEVICE), y.to(DEVICE)
+
+
+def train_model(
+    model,
+    tokenizer,
+    corpus,
+    steps,
+    batch_size,
+    learning_rate,
+    block_size,
+    progress=None
+):
+
+    ids = tokenizer.encode(corpus)
+
+    if len(ids) < block_size + 2:
+
+        raise ValueError(
+            "Adicione mais texto ao corpus."
+        )
+
+    data = torch.tensor(
+        ids,
+        dtype=torch.long
+    )
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate
+    )
+
+    model.train()
+
+    losses = []
+
+    for step in range(steps):
+
+        xb, yb = make_batches(
+            data,
+            batch_size,
+            block_size
+        )
+
+        optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        _, loss = model(xb, yb)
+
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            1.0
+        )
+
+        optimizer.step()
+
+        losses.append(
+            float(loss.item())
+        )
+
+        if progress:
+
+            progress_value = (
+                (step + 1) / steps
+            )
+
+            progress(
+                progress_value,
+                f"Etapa {step + 1}/{steps} · "
+                f"Perda: {loss.item():.4f}"
+            )
+
+    return float(
+        np.mean(
+            losses[-min(20, len(losses)):]
+        )
+    )
+
+
+# ============================================================
+# FEEDBACK
+# ============================================================
+
+def save_feedback(prompt, response, rating):
+
+    entry = {
+        "prompt": prompt,
+        "response": response,
+        "rating": rating,
+        "timestamp": time.time()
+    }
+
+    entries = []
+
+    if FEEDBACK_PATH.exists():
+
+        try:
+
+            entries = json.loads(
+                FEEDBACK_PATH.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        except Exception:
+            entries = []
+
+    entries.append(entry)
+
+    FEEDBACK_PATH.write_text(
+        json.dumps(
+            entries[-1000:],
+            ensure_ascii=False,
+            indent=2
+        ),
+        encoding="utf-8"
+    )
+
+
+# ============================================================
+# GENERATION
+# ============================================================
+
+def generate_reply(
+    prompt,
+    history,
+    max_new_tokens,
+    temperature,
+    top_k
+):
+
+    model = st.session_state.model
+    tokenizer = st.session_state.tokenizer
+
+    conversation = SYSTEM_PROMPT
+
+    for message in history[-6:]:
+
+        role = (
+            "Usuário"
+            if message["role"] == "user"
+            else "Fruitzim"
+        )
+
+        conversation += (
+            f"{role}: {message['content']}\n"
+        )
+
+    conversation += (
+        f"Usuário: {prompt}\nFruitzim:"
+    )
+
+    ids = tokenizer.encode(
+        conversation,
+        add_bos=True
+    )
+
+    idx = torch.tensor(
+        [ids],
+        dtype=torch.long,
+        device=DEVICE
+    )
+
+    output = model.generate(
+        idx,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k
+    )
+
+    generated = tokenizer.decode(
+        output[0, len(ids):].tolist()
+    )
+
+    generated = generated.split(
+        "\nUsuário:"
+    )[0]
+
+    generated = generated.split(
+        "\nFruitzim:"
+    )[0]
+
+    generated = generated.strip()
+
+    if not generated:
+
+        return (
+            "Ainda estou aprendendo a formar "
+            "respostas. Treine-me com mais textos! 🍎"
+        )
+
+    return generated
+
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+def initialize_session():
+
+    if "model" not in st.session_state:
+
+        loaded = load_checkpoint()
+
+        if loaded:
+
+            (
+                st.session_state.model,
+                st.session_state.tokenizer,
+                checkpoint
+            ) = loaded
+
+            st.session_state.trained_steps = (
+                checkpoint.get("trained_steps", 0)
+            )
+
+            st.session_state.corpus_chars = (
+                checkpoint.get("corpus_chars", 0)
+            )
+
+            st.session_state.config = (
+                checkpoint["config"]
+            )
+
+        else:
+
+            st.session_state.model = None
+            st.session_state.tokenizer = None
+            st.session_state.trained_steps = 0
+            st.session_state.corpus_chars = 0
+            st.session_state.config = None
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+
+# ============================================================
+# INTERFACE
+# ============================================================
+
+st.set_page_config(
+    page_title="Fruitzim LLM",
+    page_icon="🍎",
+    layout="wide"
+)
+
+initialize_session()
 
 st.markdown(
     """
     <style>
-        .block-container {max-width: 1100px; padding-top: 1.8rem;}
-        .fruit-card {
-            border: 1px solid rgba(120, 160, 120, .28);
-            border-radius: 22px;
-            padding: 20px 16px;
-            text-align: center;
-            background: linear-gradient(145deg, rgba(235,255,235,.85), rgba(255,248,232,.92));
-        }
-        .fruit-face {font-size: 5rem; line-height: 1.15;}
-        .fruit-name {font-size: 1.55rem; font-weight: 800; margin-top: .3rem;}
-        .fruit-mood {font-size: .95rem; opacity: .78; margin-top: .2rem;}
-        .small-note {font-size: .86rem; opacity: .78;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-initialize_session()
-agent: FruitzimNetwork = st.session_state.fruitzim_agent
-
-st.title("🍎 Fruitzim")
-st.caption("Uma pequena maçã neural: recebe texto, escolhe um estilo de resposta e aprende com seu feedback.")
-
-# O chat_input é processado antes das métricas para que elas reflitam a
-# propagação direta da mensagem recém-enviada.
-prompt = st.chat_input("Converse com o Fruitzim...")
-if prompt:
-    previous = st.session_state.fruitzim_last_interaction
-    if previous and previous.get("pending", False):
-        previous_message_list = st.session_state.fruitzim_messages
-        if previous_message_list and previous_message_list[-1].get("role") == "assistant":
-            previous_message_list[-1]["feedback"] = "Sem avaliação"
-
-    x, action, probabilities, active_neurons = agent.choose_action(prompt)
-    answer = make_response(prompt, action)
-
-    st.session_state.fruitzim_messages.append(
-        {"role": "user", "content": prompt}
-    )
-    st.session_state.fruitzim_messages.append(
-        {
-            "role": "assistant",
-            "content": answer,
-            "strategy": ACTIONS[action],
-            "confidence": float(probabilities[action]),
-        }
-    )
-    st.session_state.fruitzim_last_interaction = {
-        "x": x.tolist(),
-        "action": int(action),
-        "pending": True,
-        "active_neurons": int(active_neurons),
-        "confidence": float(probabilities[action]),
-        "timestamp": time.time(),
+    .stApp {
+        background: linear-gradient(
+            145deg,
+            #fffaf2,
+            #f4fff5
+        );
     }
 
-face, mood = get_mood(agent)
-weight_norm = agent.weight_l2_norm()
-active_display = f"{agent.last_active_neurons:,}".replace(",", ".")
-total_display = f"{TOTAL_NEURONS:,}".replace(",", ".")
+    [data-testid="stMetric"] {
+        background: rgba(255,255,255,.8);
+        padding: 12px;
+        border-radius: 14px;
+        border: 1px solid #e7eee5;
+    }
 
-panel_col, metrics_col = st.columns([1, 2.25], gap="large")
-with panel_col:
+    .fruit-card {
+        background: white;
+        border: 1px solid #e8eee6;
+        border-radius: 22px;
+        padding: 22px;
+        text-align: center;
+        box-shadow: 0 8px 28px rgba(30,70,35,.06);
+    }
+
+    .fruit-face {
+        font-size: 76px;
+        line-height: 1.2;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+st.title("🍎 Fruitzim LLM")
+
+st.caption(
+    "Uma pequena maçã neural que aprende "
+    "padrões de linguagem e gera texto."
+)
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.header("🧠 Arquitetura neural")
+
+    st.write(
+        f"Dispositivo: **{DEVICE.type.upper()}**"
+    )
+
+    n_embd = st.select_slider(
+        "Dimensão dos embeddings",
+        options=[32, 48, 64, 96, 128],
+        value=64
+    )
+
+    n_head = st.select_slider(
+        "Cabeças de atenção",
+        options=[2, 4, 8],
+        value=4
+    )
+
+    n_layer = st.slider(
+        "Blocos Transformer",
+        1,
+        4,
+        2
+    )
+
+    block_size = st.select_slider(
+        "Contexto",
+        options=[64, 96, 128, 192, 256],
+        value=128
+    )
+
+    dropout = st.slider(
+        "Dropout",
+        0.0,
+        0.4,
+        0.1,
+        0.05
+    )
+
+    st.divider()
+
+    st.header("📚 Corpus de treinamento")
+
+    uploaded_file = st.file_uploader(
+        "Adicionar arquivo TXT",
+        type=["txt"]
+    )
+
+    uploaded_text = ""
+
+    if uploaded_file:
+
+        uploaded_text = uploaded_file.getvalue().decode(
+            "utf-8",
+            errors="replace"
+        )
+
+    include_builtin = st.checkbox(
+        "Incluir corpus inicial",
+        value=True
+    )
+
+    corpus = (
+        BUILTIN_CORPUS if include_builtin else ""
+    ) + "\n\n" + uploaded_text
+
+    st.caption(
+        f"{len(corpus):,} caracteres disponíveis"
+    )
+
+    st.divider()
+
+    st.header("⚙️ Treinamento")
+
+    steps = st.slider(
+        "Etapas",
+        20,
+        1000,
+        200,
+        20
+    )
+
+    batch_size = st.select_slider(
+        "Batch size",
+        options=[8, 16, 24, 32],
+        value=16
+    )
+
+    learning_rate = st.select_slider(
+        "Taxa de aprendizado",
+        options=[
+            0.0001,
+            0.0003,
+            0.0005,
+            0.001,
+            0.003
+        ],
+        value=0.001,
+        format_func=lambda value: f"{value:g}"
+    )
+
+    train_button = st.button(
+        "🍏 Treinar Fruitzim",
+        type="primary",
+        use_container_width=True
+    )
+
+    reset_button = st.button(
+        "♻️ Reinicializar modelo",
+        use_container_width=True
+    )
+
+
+# ============================================================
+# RESET
+# ============================================================
+
+if reset_button:
+
+    st.session_state.model = None
+    st.session_state.tokenizer = None
+    st.session_state.trained_steps = 0
+    st.session_state.corpus_chars = 0
+    st.session_state.config = None
+    st.session_state.messages = []
+
+    if CHECKPOINT_PATH.exists():
+        CHECKPOINT_PATH.unlink()
+
+    if VOCAB_PATH.exists():
+        VOCAB_PATH.unlink()
+
+    st.rerun()
+
+
+# ============================================================
+# TRAINING EXECUTION
+# ============================================================
+
+if train_button:
+
+    if not corpus.strip():
+
+        st.error(
+            "Adicione textos para treinar o Fruitzim."
+        )
+
+    elif n_embd % n_head != 0:
+
+        st.error(
+            "A dimensão precisa ser divisível "
+            "pelo número de cabeças."
+        )
+
+    else:
+
+        config = {
+            "block_size": block_size,
+            "n_embd": n_embd,
+            "n_head": n_head,
+            "n_layer": n_layer,
+            "dropout": dropout
+        }
+
+        tokenizer = CharTokenizer.from_text(
+            corpus
+        )
+
+        old_model = st.session_state.model
+
+        architecture_changed = (
+            old_model is None
+            or st.session_state.config != config
+            or st.session_state.tokenizer.itos
+            != tokenizer.itos
+        )
+
+        if architecture_changed:
+
+            st.session_state.model = build_model(
+                tokenizer,
+                config
+            )
+
+            st.session_state.tokenizer = tokenizer
+            st.session_state.trained_steps = 0
+            st.session_state.config = config
+
+        progress_bar = st.progress(0.0)
+        status = st.empty()
+
+        try:
+
+            average_loss = train_model(
+                st.session_state.model,
+                st.session_state.tokenizer,
+                corpus,
+                steps,
+                batch_size,
+                learning_rate,
+                block_size,
+                progress=lambda value, message: (
+                    progress_bar.progress(value),
+                    status.caption(message)
+                )
+            )
+
+            st.session_state.trained_steps += steps
+
+            st.session_state.corpus_chars = len(corpus)
+
+            save_checkpoint(
+                st.session_state.model,
+                st.session_state.tokenizer,
+                config,
+                st.session_state.trained_steps,
+                st.session_state.corpus_chars
+            )
+
+            st.success(
+                f"Treinamento concluído! "
+                f"Perda recente: {average_loss:.4f}"
+            )
+
+        except Exception as error:
+
+            st.error(
+                f"Erro no treinamento: {error}"
+            )
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+model = st.session_state.model
+
+if model is None:
+
+    face = "🥺"
+    mood = "Aguardando treinamento"
+    parameters = 0
+    weight_norm = 0.0
+
+else:
+
+    face = "🍎"
+    mood = "Pronto para aprender!"
+
+    parameters = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+    )
+
+    weight_norm = math.sqrt(
+        sum(
+            float(
+                torch.sum(
+                    parameter.detach() ** 2
+                ).item()
+            )
+            for parameter in model.parameters()
+        )
+    )
+
+
+left, right = st.columns([1, 2])
+
+with left:
+
     st.markdown(
         f"""
         <div class="fruit-card">
             <div class="fruit-face">{face}</div>
-            <div class="fruit-name">Fruitzim</div>
-            <div class="fruit-mood">{mood}</div>
+            <h2>Fruitzim</h2>
+            <p>{mood}</p>
+            <small>Neural Language Model</small>
         </div>
         """,
-        unsafe_allow_html=True,
+        unsafe_allow_html=True
     )
-    st.caption("O rostinho acompanha a última recompensa e a ativação da rede.")
 
-with metrics_col:
-    st.subheader("Painel neural")
-    metric_cols = st.columns(4)
-    metric_cols[0].metric("Unidades na arquitetura", total_display)
-    metric_cols[1].metric("Unidades ativas", active_display)
-    metric_cols[2].metric("Ciclos de reforço", f"{agent.training_cycles:,}".replace(",", "."))
-    metric_cols[3].metric("Norma L2 dos pesos", f"{weight_norm:.3f}")
+with right:
 
-    activation_percent = agent.last_active_neurons / TOTAL_NEURONS
-    st.caption(
-        "Ativação: ReLU positivo nas camadas ocultas + saídas Softmax "
-        "com probabilidade igual ou superior à média."
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "Parâmetros",
+        f"{parameters:,}"
     )
-    st.progress(float(np.clip(activation_percent, 0.0, 1.0)))
+
+    col2.metric(
+        "Etapas de treinamento",
+        f"{st.session_state.trained_steps:,}"
+    )
+
+    col3.metric(
+        "Norma L2",
+        f"{weight_norm:,.2f}"
+    )
+
+    st.info(
+        "O Fruitzim começa com pesos aleatórios. "
+        "Seu conhecimento depende dos textos usados "
+        "durante o treinamento."
+    )
+
+
+# ============================================================
+# CHAT
+# ============================================================
 
 st.divider()
-st.subheader("💬 Conversa")
 
-if not st.session_state.fruitzim_messages:
-    st.info("Envie uma mensagem para iniciar. O Fruitzim escolherá uma das oito estratégias de resposta.")
+st.subheader("💬 Conversa com Fruitzim")
 
-for message in st.session_state.fruitzim_messages:
-    if message["role"] == "user":
-        with st.chat_message("user", avatar="🧑‍💻"):
-            st.text(message["content"])
-    else:
-        with st.chat_message("assistant", avatar="🍎"):
-            st.markdown(message["content"])
-            st.caption(
-                f"Estratégia neural: {message.get('strategy', '—')} · "
-                f"Probabilidade da ação: {message.get('confidence', 0.0):.1%}"
+if model is None or st.session_state.trained_steps == 0:
+
+    st.warning(
+        "Treine o modelo antes de iniciar uma conversa."
+    )
+
+else:
+
+    temperature = st.slider(
+        "Criatividade",
+        0.2,
+        1.5,
+        0.8,
+        0.05
+    )
+
+    top_k = st.slider(
+        "Top-k",
+        1,
+        min(50, len(st.session_state.tokenizer.itos)),
+        min(30, len(st.session_state.tokenizer.itos))
+    )
+
+    max_new_tokens = st.slider(
+        "Caracteres gerados",
+        40,
+        400,
+        180,
+        20
+    )
+
+    for index, message in enumerate(
+        st.session_state.messages
+    ):
+
+        with st.chat_message(
+            message["role"],
+            avatar=(
+                "🍎"
+                if message["role"] == "assistant"
+                else "🙂"
             )
-            if message.get("feedback"):
-                st.caption(f"Feedback: {message['feedback']}")
+        ):
 
-trace = st.session_state.fruitzim_last_interaction
-if trace and trace.get("pending", False):
-    st.markdown("**Como foi esta resposta? Seu feedback atualiza os pesos da rede.**")
-    feedback_cols = st.columns(3)
-    feedback_cols[0].button(
-        "💚 Carinho (+0,3)",
-        use_container_width=True,
-        key="fruitzim_feedback_carinho",
-        on_click=apply_feedback,
-        args=(0.3, "Carinho"),
-    )
-    feedback_cols[1].button(
-        "👍 Boa resposta (+1,0)",
-        use_container_width=True,
-        key="fruitzim_feedback_boa",
-        on_click=apply_feedback,
-        args=(1.0, "Boa resposta"),
-    )
-    feedback_cols[2].button(
-        "👎 Punição (-1,0)",
-        use_container_width=True,
-        key="fruitzim_feedback_punicao",
-        on_click=apply_feedback,
-        args=(-1.0, "Punição"),
-    )
-elif trace and trace.get("feedback_label"):
-    st.success(
-        f"Feedback aplicado: {trace['feedback_label']} · "
-        f"vantagem {trace['advantage']:+.3f} · "
-        f"norma do gradiente {trace['gradient_norm']:.3f}."
-    )
+            st.markdown(
+                message["content"]
+            )
 
-with st.sidebar:
-    st.header("🧠 Arquitetura")
-    st.code(
-        "Entrada: 64 características\n"
-        "       ↓\n"
-        "Oculta 1: 4.096 · ReLU\n"
-        "       ↓\n"
-        "Oculta 2: 1.354 · ReLU\n"
-        "       ↓\n"
-        "Saída: 8 · Softmax\n\n"
-        "Total contado: 5.458 unidades",
-        language="text",
-    )
-    st.caption(
-        "A entrada é um vetor de características, não uma camada contada na "
-        "soma solicitada: 4.096 + 1.354 + 8 = 5.458."
-    )
+            if (
+                message["role"] == "assistant"
+                and message.get("prompt")
+            ):
 
-    st.header("🎓 Como o reforço funciona")
-    st.write(
-        "Cada mensagem é um contexto; a rede escolhe uma estratégia pela "
-        "distribuição Softmax. O botão escolhido fornece uma recompensa. "
-        "O Fruitzim calcula a vantagem em relação a uma média móvel e aplica "
-        "REINFORCE com gradiente limitado em W1, W2, W3 e vieses."
-    )
-    st.caption(
-        "É aprendizado por reforço de uma etapa (contextual bandit), não "
-        "treinamento conversacional de longo prazo."
-    )
+                st.caption(
+                    "Resposta gerada pelo Transformer"
+                )
 
-    st.header("ℹ️ Limites do protótipo")
-    st.write(
-        "A rede é inicializada do zero. Ela aprende a favorecer estilos de "
-        "resposta em contextos parecidos, mas não possui conhecimento geral "
-        "nem um modelo de linguagem pré-treinado. As frases são templates "
-        "locais escolhidos pela saída neural."
-    )
-    st.write(
-        "Os pesos ficam na sessão atual do navegador e na memória do processo. "
-        "Eles não são gravados em disco e podem ser perdidos quando a sessão "
-        "ou a instância do Streamlit Cloud for reiniciada."
+                feedback_cols = st.columns(3)
+
+                if feedback_cols[0].button(
+                    "💚 Boa",
+                    key=f"good_{index}"
+                ):
+
+                    save_feedback(
+                        message["prompt"],
+                        message["content"],
+                        "positive"
+                    )
+
+                    st.toast(
+                        "Feedback positivo registrado!"
+                    )
+
+                if feedback_cols[1].button(
+                    "👎 Ruim",
+                    key=f"bad_{index}"
+                ):
+
+                    save_feedback(
+                        message["prompt"],
+                        message["content"],
+                        "negative"
+                    )
+
+                    st.toast(
+                        "Feedback negativo registrado!"
+                    )
+
+                if feedback_cols[2].button(
+                    "🤍 Neutro",
+                    key=f"neutral_{index}"
+                ):
+
+                    save_feedback(
+                        message["prompt"],
+                        message["content"],
+                        "neutral"
+                    )
+
+                    st.toast(
+                        "Feedback neutro registrado!"
+                    )
+
+    prompt = st.chat_input(
+        "Converse com o Fruitzim..."
     )
 
-    if st.button("♻️ Reiniciar Fruitzim", use_container_width=True):
-        seed = int(np.random.SeedSequence().generate_state(1)[0])
-        st.session_state.fruitzim_agent = FruitzimNetwork(seed=seed)
-        st.session_state.fruitzim_messages = []
-        st.session_state.fruitzim_last_interaction = None
+    if prompt:
+
+        history = st.session_state.messages.copy()
+
+        st.session_state.messages.append(
+            {
+                "role": "user",
+                "content": prompt
+            }
+        )
+
+        with st.chat_message(
+            "user",
+            avatar="🙂"
+        ):
+
+            st.markdown(prompt)
+
+        with st.chat_message(
+            "assistant",
+            avatar="🍎"
+        ):
+
+            with st.spinner(
+                "Fruitzim está pensando..."
+            ):
+
+                answer = generate_reply(
+                    prompt,
+                    history,
+                    max_new_tokens,
+                    temperature,
+                    top_k
+                )
+
+            st.markdown(answer)
+
+            st.caption(
+                "Gerado pelo Transformer do Fruitzim"
+            )
+
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": answer,
+                "prompt": prompt
+            }
+        )
+
         st.rerun()
+
+
+# ============================================================
+# INFORMATION
+# ============================================================
+
+with st.expander(
+    "🧠 Como funciona o Fruitzim?"
+):
+
+    st.markdown(
+        """
+        ### Arquitetura
+
+        - Decoder-only Transformer.
+        - Token embeddings.
+        - Positional embeddings.
+        - Causal Self-Attention.
+        - Feed Forward Network.
+        - GELU.
+        - Layer Normalization.
+        - Residual Connections.
+        - Softmax para previsão do próximo token.
+
+        ### Treinamento
+
+        O Fruitzim aprende a prever o próximo caractere
+        em uma sequência textual.
+
+        O treinamento utiliza:
+
+        - Cross Entropy.
+        - Backpropagation.
+        - AdamW.
+        - Gradient Clipping.
+
+        ### Feedback
+
+        As avaliações positivas e negativas são salvas
+        em um arquivo JSON.
+
+        Nesta versão, o feedback ainda não modifica
+        automaticamente os pesos. Para ensinar o modelo,
+        acrescente exemplos revisados ao corpus e execute
+        uma nova etapa de treinamento.
+
+        ### Persistência
+
+        Os pesos são salvos em:
+
+        `fruitzim_data/fruitzim_checkpoint.pt`
+
+        O vocabulário é salvo em:
+
+        `fruitzim_data/vocab.json`
+
+        ### Limitações
+
+        Este é um modelo experimental pequeno, treinado
+        do zero, sem pesos pré-treinados.
+
+        Ele não possui conhecimento geral prévio.
+        Sua qualidade depende da quantidade e da qualidade
+        dos textos utilizados no treinamento.
+        """
+    )
+
+st.caption(
+    "🍎 Fruitzim LLM · Modelo experimental "
+    "treinado do zero · Python + PyTorch + NumPy"
+)
